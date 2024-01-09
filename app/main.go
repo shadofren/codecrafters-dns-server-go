@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -74,6 +75,13 @@ type DNSResponse struct {
 }
 
 func main() {
+	var resolver string
+	var remoteServerAddr *net.UDPAddr
+	var remoteServerConn *net.UDPConn
+
+	flag.StringVar(&resolver, "resolver", "default_value", "")
+	flag.Parse()
+
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:2053")
 	if err != nil {
 		fmt.Println("Failed to resolve UDP address:", err)
@@ -88,15 +96,12 @@ func main() {
 	defer udpConn.Close()
 
 	buf := make([]byte, 512)
-
 	for {
 		size, source, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			fmt.Println("Error receiving data:", err)
 			break
 		}
-		var RData [4]byte
-		binary.BigEndian.PutUint32(RData[:], 134744072)
 
 		receivedData := string(buf[:size])
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
@@ -105,7 +110,6 @@ func main() {
 		// 12 bytes
 		binary.Read(reader, binary.BigEndian, &dnsHeader)
 
-		// offset is from the start of the message, so need to use everything, but move 12 bytes
 		dnsQuestions := make([]DNSQuestion, 0)
 		dnsAnswers := make([]DNSResourceRecord, 0)
 		for reader.Len() != 0 {
@@ -114,22 +118,51 @@ func main() {
 				log.Fatal("Error parsing DNS Question:", err)
 			}
 			dnsQuestions = append(dnsQuestions, *question)
-			answer := DNSResourceRecord{
-				Name:     question.Name,
-				Type:     TypeA,
-				Class:    1, // IN (Internet)
-				TTL:      300,
-				RDLength: 4,
-				RData:    RData[:],
-			}
-			dnsAnswers = append(dnsAnswers, answer)
 		}
+
+		if resolver != "" {
+			fmt.Println("working with remote server", resolver)
+			// reset this as we are contacting the remote server
+			dnsAnswers = make([]DNSResourceRecord, 0)
+			remoteServerAddr, err = net.ResolveUDPAddr("udp", resolver)
+			if err != nil {
+				fmt.Println("Failed to resolve remote server address:", err)
+			}
+			remoteServerConn, err = net.DialUDP("udp", nil, remoteServerAddr)
+			if err != nil {
+				fmt.Println("Failed to connect to remote server:", err)
+			}
+			_ = remoteServerConn
+			defer remoteServerConn.Close()
+			// reusing the same header field so temporarily set the question count to 1 for packing
+			dnsHeader.QDCount = 1
+			// Clone the DNSQuestion
+			for _, question := range dnsQuestions {
+				dnsQ := DNSResponse{Header: dnsHeader,
+					Question: []DNSQuestion{question},
+				}
+				data, _ := packDNSResponse(dnsQ)
+				_, err := remoteServerConn.Write(data)
+				if err != nil {
+					fmt.Println("Error Sending packet to remote server", err)
+				}
+				size, err := remoteServerConn.Read(buf)
+				if err != nil {
+					fmt.Println("Error receiving data:", err)
+					break
+				}
+				response := parseDNSResponse(bytes.NewReader(buf[:size]))
+				dnsAnswers = append(dnsAnswers, response.Answers...)
+			}
+		}
+
 		// Create an empty response
 		response := DNSResponse{Header: dnsHeader,
 			Question: dnsQuestions,
 			Answers:  dnsAnswers,
 		}
-		response.Header.QDCount = uint16(len(dnsQuestions)) // we added one question
+		// set the correct question/answer count
+		response.Header.QDCount = uint16(len(dnsQuestions))
 		response.Header.ANCount = uint16(len(dnsAnswers))
 		response.Header.Flags |= (1 << 15) // set the QR (Query/Response) bit to indicate a response
 		// RCODE is 0 (no error) if OPCODE is 0 (standard query) else 4 (not implemented)
@@ -142,6 +175,34 @@ func main() {
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
 		}
+	}
+}
+
+func parseDNSResponse(reader *bytes.Reader) *DNSResponse {
+	// read the header
+	var dnsHeader DNSHeader
+	// 12 bytes
+	binary.Read(reader, binary.BigEndian, &dnsHeader)
+	questions := make([]DNSQuestion, 0)
+	for i := 0; i < int(dnsHeader.QDCount); i++ {
+		question, err := parseDNSQuestion(reader)
+		if err != nil {
+			return nil
+		}
+		questions = append(questions, *question)
+	}
+	answers := make([]DNSResourceRecord, 0)
+	for i := 0; i < int(dnsHeader.ANCount); i++ {
+		answer, err := parseDNSAnswer(reader)
+		if err != nil {
+			return nil
+		}
+		answers = append(answers, *answer)
+	}
+	return &DNSResponse{
+		Header:   dnsHeader,
+		Question: questions,
+		Answers:  answers,
 	}
 }
 
@@ -215,6 +276,30 @@ func parseDNSQuestion(reader *bytes.Reader) (*DNSQuestion, error) {
 	}, nil
 }
 
+func parseDNSAnswer(reader *bytes.Reader) (*DNSResourceRecord, error) {
+	name, err := readName(reader)
+	if err != nil {
+		return nil, err
+	}
+	var aType, aClass, rdLength uint16
+	var ttl uint32
+
+	binary.Read(reader, binary.BigEndian, &aType)
+	binary.Read(reader, binary.BigEndian, &aClass)
+	binary.Read(reader, binary.BigEndian, &ttl)
+	binary.Read(reader, binary.BigEndian, &rdLength)
+	var rData = make([]byte, rdLength)
+	binary.Read(reader, binary.BigEndian, &rData)
+
+	return &DNSResourceRecord{Name: labelSequence(name),
+		Type:     aType,
+		Class:    aClass,
+		TTL:      ttl,
+		RDLength: rdLength,
+		RData:    rData,
+	}, nil
+}
+
 func packDNSResponse(response DNSResponse) ([]byte, error) {
 	// Create a buffer to hold the binary representation
 	size := 12
@@ -273,10 +358,4 @@ func labelSequence(domain string) []byte {
 	}
 	sequence = append(sequence, '\x00')
 	return sequence
-}
-
-func intToByte(n int) []byte {
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, uint16(n))
-	return b
 }
