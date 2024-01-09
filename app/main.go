@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
 	"strings"
 )
 
@@ -100,23 +100,19 @@ func main() {
 
 		receivedData := string(buf[:size])
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
+		reader := bytes.NewReader(buf[:size])
 		var dnsHeader DNSHeader
-		binary.Read(bytes.NewReader(buf[:12]), binary.BigEndian, &dnsHeader)
+		// 12 bytes
+		binary.Read(reader, binary.BigEndian, &dnsHeader)
 
 		// offset is from the start of the message, so need to use everything, but move 12 bytes
-		reader := bytes.NewReader(buf[:size])
-		reader.Seek(12, os.SEEK_SET)
 		dnsQuestions := make([]DNSQuestion, 0)
 		dnsAnswers := make([]DNSResourceRecord, 0)
-		for {
-			if reader.Len() == 0 {
-				break
-			}
+		for reader.Len() != 0 {
 			question, err := parseDNSQuestion(reader)
 			if err != nil {
 				log.Fatal("Error parsing DNS Question:", err)
 			}
-      fmt.Println("parsed question", question)
 			dnsQuestions = append(dnsQuestions, *question)
 			answer := DNSResourceRecord{
 				Name:     question.Name,
@@ -171,10 +167,10 @@ func readName(reader *bytes.Reader) (string, error) {
 			}
 			offset := (uint16(length&0x3F) << 8) | uint16(offsetByte)
 			// save the current position
-			curPos, _ := reader.Seek(0, os.SEEK_CUR)
+			curPos, _ := reader.Seek(0, io.SeekCurrent)
 
 			// move to the offset position
-			_, err = reader.Seek(int64(offset), os.SEEK_SET)
+			_, err = reader.Seek(int64(offset), io.SeekStart)
 			if err != nil {
 				return "", err
 			}
@@ -186,7 +182,7 @@ func readName(reader *bytes.Reader) (string, error) {
 			}
 
 			// Restore the original position
-			_, err = reader.Seek(int64(curPos), os.SEEK_SET)
+			_, err = reader.Seek(int64(curPos), io.SeekStart)
 			if err != nil {
 				return "", err
 			}
