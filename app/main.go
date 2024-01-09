@@ -21,7 +21,23 @@ const (
 	TypeSOA   = 6   // Start of authority
 	TypeANY   = 255 // Wildcard match any type
 )
-
+/*
+                                  1  1  1  1  1  1
+    0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5
+   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+   |                      ID                       |
+   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+   |QR|   Opcode  |AA|TC|RD|RA|   Z    |   RCODE   |
+   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+   |                    QDCOUNT                    |
+   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+   |                    ANCOUNT                    |
+   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+   |                    NSCOUNT                    |
+   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+   |                    ARCOUNT                    |
+   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+*/
 type DNSHeader struct {
 	ID      uint16
 	Flags   uint16 // embedded struct for multiple flags
@@ -86,7 +102,6 @@ func main() {
 			Question: make([]DNSQuestion, 0),
 			Answers:  make([]DNSResourceRecord, 0),
 		}
-		response.Header.ID = 1234
 		response.Question = append(response.Question, DNSQuestion{
 			Name:  labelSequence("codecrafters.io"),
 			Type:  TypeA,
@@ -106,6 +121,10 @@ func main() {
 		})
 		response.Header.ANCount = 1
 		response.Header.Flags |= (1 << 15) // set the QR (Query/Response) bit to indicate a response
+		// RCODE is 0 (no error) if OPCODE is 0 (standard query) else 4 (not implemented)
+		if (response.Header.Flags & 0x7800) != 0 {
+			response.Header.Flags |= 4
+		}
 		respBytes, _ := packDNSResponse(response)
 
 		_, err = udpConn.WriteToUDP(respBytes, source)
