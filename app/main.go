@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"strings"
 )
 
@@ -93,31 +95,46 @@ func main() {
 			fmt.Println("Error receiving data:", err)
 			break
 		}
+		var RData [4]byte
+		binary.BigEndian.PutUint32(RData[:], 134744072)
 
 		receivedData := string(buf[:size])
 		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
 		var dnsHeader DNSHeader
 		binary.Read(bytes.NewReader(buf[:12]), binary.BigEndian, &dnsHeader)
 
-		dnsQuestion := parseQuestion(buf[12:])
+		// offset is from the start of the message, so need to use everything, but move 12 bytes
+		reader := bytes.NewReader(buf[:size])
+		reader.Seek(12, os.SEEK_SET)
+		dnsQuestions := make([]DNSQuestion, 0)
+		dnsAnswers := make([]DNSResourceRecord, 0)
+		for {
+			if reader.Len() == 0 {
+				break
+			}
+			question, err := parseDNSQuestion(reader)
+			if err != nil {
+				log.Fatal("Error parsing DNS Question:", err)
+			}
+      fmt.Println("parsed question", question)
+			dnsQuestions = append(dnsQuestions, *question)
+			answer := DNSResourceRecord{
+				Name:     question.Name,
+				Type:     TypeA,
+				Class:    1, // IN (Internet)
+				TTL:      300,
+				RDLength: 4,
+				RData:    RData[:],
+			}
+			dnsAnswers = append(dnsAnswers, answer)
+		}
 		// Create an empty response
 		response := DNSResponse{Header: dnsHeader,
-			Question: []DNSQuestion{dnsQuestion},
-			Answers:  make([]DNSResourceRecord, 0),
+			Question: dnsQuestions,
+			Answers:  dnsAnswers,
 		}
-		response.Header.QDCount = 1 // we added one question
-		var RData [4]byte
-		binary.BigEndian.PutUint32(RData[:], 134744072)
-
-		response.Answers = append(response.Answers, DNSResourceRecord{
-			Name:     dnsQuestion.Name,
-			Type:     TypeA,
-			Class:    1, // IN (Internet)
-			TTL:      300,
-			RDLength: 4,
-			RData:    RData[:],
-		})
-		response.Header.ANCount = 1
+		response.Header.QDCount = uint16(len(dnsQuestions)) // we added one question
+		response.Header.ANCount = uint16(len(dnsAnswers))
 		response.Header.Flags |= (1 << 15) // set the QR (Query/Response) bit to indicate a response
 		// RCODE is 0 (no error) if OPCODE is 0 (standard query) else 4 (not implemented)
 		if (response.Header.Flags & 0x7800) != 0 {
@@ -132,32 +149,74 @@ func main() {
 	}
 }
 
-//	type DNSQuestion struct {
-//		Name  []byte
-//		Type  uint16
-//		Class uint16
-//	}
-func parseQuestion(data []byte) DNSQuestion {
-	// there are multiple section, each section is a single byte indicate section size
-	i := 0
-	n := len(data)
-	var size uint8 = 0
-	var name []byte
-	for i < n {
-		if data[i] == '\x00' {
-			// ending marker
-			i++
-			name = data[:i] // including the marker
+func readName(reader *bytes.Reader) (string, error) {
+	var labels []string
+	for {
+		// read the length byte
+		length, err := reader.ReadByte()
+		if err != nil {
+			return "", err
+		}
+
+		if length == 0 {
+			break // zero length indicate end of domain
+		}
+
+		// check if the label is compressed
+		if (length >> 6) == 0x3 {
+			// This is a pointer so read the next byte to form the 14-bit offset
+			offsetByte, err := reader.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			offset := (uint16(length&0x3F) << 8) | uint16(offsetByte)
+			// save the current position
+			curPos, _ := reader.Seek(0, os.SEEK_CUR)
+
+			// move to the offset position
+			_, err = reader.Seek(int64(offset), os.SEEK_SET)
+			if err != nil {
+				return "", err
+			}
+
+			// recursively read the name from new location
+			label, err := readName(reader)
+			if err != nil {
+				return "", err
+			}
+
+			// Restore the original position
+			_, err = reader.Seek(int64(curPos), os.SEEK_SET)
+			if err != nil {
+				return "", err
+			}
+			labels = append(labels, label)
 			break
 		}
-		// first byte is the size
-		binary.Read(bytes.NewReader(data[i:i+1]), binary.BigEndian, &size)
-		i += int(size) + 1 // move to the next section
+
+		// Read the labels
+		labelBytes := make([]byte, length)
+		_, err = reader.Read(labelBytes)
+		if err != nil {
+			return "", err
+		}
+		labels = append(labels, string(labelBytes))
 	}
-	var t, c uint16
-	binary.Read(bytes.NewReader(data[i:i+2]), binary.BigEndian, &t)
-	binary.Read(bytes.NewReader(data[i+2:i+4]), binary.BigEndian, &c)
-	return DNSQuestion{name, t, c}
+	return strings.Join(labels, "."), nil
+}
+
+func parseDNSQuestion(reader *bytes.Reader) (*DNSQuestion, error) {
+	name, err := readName(reader)
+	if err != nil {
+		return nil, err
+	}
+	var qType, qClass uint16
+	binary.Read(reader, binary.BigEndian, &qType)
+	binary.Read(reader, binary.BigEndian, &qClass)
+	return &DNSQuestion{Name: labelSequence(name),
+		Type:  qType,
+		Class: qClass,
+	}, nil
 }
 
 func packDNSResponse(response DNSResponse) ([]byte, error) {
