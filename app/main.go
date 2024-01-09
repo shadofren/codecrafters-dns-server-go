@@ -21,22 +21,24 @@ const (
 	TypeSOA   = 6   // Start of authority
 	TypeANY   = 255 // Wildcard match any type
 )
+
 /*
-                                  1  1  1  1  1  1
-    0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5
-   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-   |                      ID                       |
-   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-   |QR|   Opcode  |AA|TC|RD|RA|   Z    |   RCODE   |
-   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-   |                    QDCOUNT                    |
-   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-   |                    ANCOUNT                    |
-   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-   |                    NSCOUNT                    |
-   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
-   |                    ARCOUNT                    |
-   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+	                              1  1  1  1  1  1
+	0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5
+
++--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+|                      ID                       |
++--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+|QR|   Opcode  |AA|TC|RD|RA|   Z    |   RCODE   |
++--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+|                    QDCOUNT                    |
++--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+|                    ANCOUNT                    |
++--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+|                    NSCOUNT                    |
++--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+|                    ARCOUNT                    |
++--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
 */
 type DNSHeader struct {
 	ID      uint16
@@ -97,22 +99,18 @@ func main() {
 		var dnsHeader DNSHeader
 		binary.Read(bytes.NewReader(buf[:12]), binary.BigEndian, &dnsHeader)
 
+		dnsQuestion := parseQuestion(buf[12:])
 		// Create an empty response
 		response := DNSResponse{Header: dnsHeader,
-			Question: make([]DNSQuestion, 0),
+			Question: []DNSQuestion{dnsQuestion},
 			Answers:  make([]DNSResourceRecord, 0),
 		}
-		response.Question = append(response.Question, DNSQuestion{
-			Name:  labelSequence("codecrafters.io"),
-			Type:  TypeA,
-			Class: 1, // IN (Internet)
-		})
 		response.Header.QDCount = 1 // we added one question
 		var RData [4]byte
 		binary.BigEndian.PutUint32(RData[:], 134744072)
 
 		response.Answers = append(response.Answers, DNSResourceRecord{
-			Name:     labelSequence("codecrafters.io"),
+			Name:     dnsQuestion.Name,
 			Type:     TypeA,
 			Class:    1, // IN (Internet)
 			TTL:      300,
@@ -132,6 +130,34 @@ func main() {
 			fmt.Println("Failed to send response:", err)
 		}
 	}
+}
+
+//	type DNSQuestion struct {
+//		Name  []byte
+//		Type  uint16
+//		Class uint16
+//	}
+func parseQuestion(data []byte) DNSQuestion {
+	// there are multiple section, each section is a single byte indicate section size
+	i := 0
+	n := len(data)
+	var size uint8 = 0
+	var name []byte
+	for i < n {
+		if data[i] == '\x00' {
+			// ending marker
+			i++
+			name = data[:i] // including the marker
+			break
+		}
+		// first byte is the size
+		binary.Read(bytes.NewReader(data[i:i+1]), binary.BigEndian, &size)
+		i += int(size) + 1 // move to the next section
+	}
+	var t, c uint16
+	binary.Read(bytes.NewReader(data[i:i+2]), binary.BigEndian, &t)
+	binary.Read(bytes.NewReader(data[i+2:i+4]), binary.BigEndian, &c)
+	return DNSQuestion{name, t, c}
 }
 
 func packDNSResponse(response DNSResponse) ([]byte, error) {
@@ -159,7 +185,6 @@ func packDNSResponse(response DNSResponse) ([]byte, error) {
 	// Pack the DNS Questions
 	offset := 12
 	for _, question := range response.Question {
-
 		qNameLength := len(question.Name)
 		copy(buffer[offset:offset+qNameLength], question.Name)
 		offset += qNameLength
@@ -168,8 +193,8 @@ func packDNSResponse(response DNSResponse) ([]byte, error) {
 		offset += 4
 	}
 
+	// Pack the DNS answer
 	for _, answer := range response.Answers {
-		// Pack the DNS answer
 		nameLength := len(answer.Name)
 		copy(buffer[offset:offset+nameLength], []byte(answer.Name))
 		offset += nameLength
