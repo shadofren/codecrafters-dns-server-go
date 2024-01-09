@@ -37,10 +37,20 @@ type DNSQuestion struct {
 	Class uint16
 }
 
+type DNSResourceRecord struct {
+	Name     []byte
+	Type     uint16
+	Class    uint16
+	TTL      uint32
+	RDLength uint16
+	RData    []byte
+}
+
 type DNSResponse struct {
 	Header DNSHeader
 	// Add other fields as needed for your response
-	Questions []DNSQuestion
+	Question []DNSQuestion
+	Answers  []DNSResourceRecord
 }
 
 func main() {
@@ -72,14 +82,29 @@ func main() {
 		binary.Read(bytes.NewReader(buf[:12]), binary.BigEndian, &dnsHeader)
 
 		// Create an empty response
-		response := DNSResponse{Header: dnsHeader, Questions: make([]DNSQuestion, 0)}
+		response := DNSResponse{Header: dnsHeader,
+			Question: make([]DNSQuestion, 0),
+			Answers:  make([]DNSResourceRecord, 0),
+		}
 		response.Header.ID = 1234
-		response.Questions = append(response.Questions, DNSQuestion{
+		response.Question = append(response.Question, DNSQuestion{
 			Name:  labelSequence("codecrafters.io"),
 			Type:  TypeA,
 			Class: 1, // IN (Internet)
 		})
-		response.Header.QDCount = 1        // we added one question
+		response.Header.QDCount = 1 // we added one question
+		var RData [4]byte
+		binary.BigEndian.PutUint32(RData[:], 134744072)
+
+		response.Answers = append(response.Answers, DNSResourceRecord{
+			Name:     labelSequence("codecrafters.io"),
+			Type:     TypeA,
+			Class:    1, // IN (Internet)
+			TTL:      300,
+			RDLength: 4,
+			RData:    RData[:],
+		})
+		response.Header.ANCount = 1
 		response.Header.Flags |= (1 << 15) // set the QR (Query/Response) bit to indicate a response
 		respBytes, _ := packDNSResponse(response)
 
@@ -92,10 +117,16 @@ func main() {
 
 func packDNSResponse(response DNSResponse) ([]byte, error) {
 	// Create a buffer to hold the binary representation
-  size := 12
-  for i := 0; i < int(response.Header.QDCount); i++ {
-    size += len(response.Questions[i].Name) + 4
-  }
+	size := 12
+	for i := 0; i < int(response.Header.QDCount); i++ {
+		size += len(response.Question[i].Name) + 4
+	}
+
+	// Calculate the length needed for the answer section
+	for _, answer := range response.Answers {
+		size += 2 + len(answer.Name) + 10 + len(answer.RData) // Name length + Type + Class + TTL + RDLength + RData length
+	}
+
 	buffer := make([]byte, size) // Adjust the size as needed
 
 	// Pack the DNS header
@@ -108,13 +139,27 @@ func packDNSResponse(response DNSResponse) ([]byte, error) {
 
 	// Pack the DNS Questions
 	offset := 12
-	for i := 0; i < int(response.Header.QDCount); i++ {
-		qNameLength := len(response.Questions[i].Name)
-		copy(buffer[offset:offset+qNameLength], response.Questions[i].Name)
+	for _, question := range response.Question {
+
+		qNameLength := len(question.Name)
+		copy(buffer[offset:offset+qNameLength], question.Name)
 		offset += qNameLength
-		binary.BigEndian.PutUint16(buffer[offset:offset+2], response.Questions[i].Type)
-		binary.BigEndian.PutUint16(buffer[offset+2:offset+4], response.Questions[i].Class)
+		binary.BigEndian.PutUint16(buffer[offset:offset+2], question.Type)
+		binary.BigEndian.PutUint16(buffer[offset+2:offset+4], question.Class)
 		offset += 4
+	}
+
+	for _, answer := range response.Answers {
+		// Pack the DNS answer
+		nameLength := len(answer.Name)
+		copy(buffer[offset:offset+nameLength], []byte(answer.Name))
+		offset += nameLength
+		binary.BigEndian.PutUint16(buffer[offset:offset+2], answer.Type)
+		binary.BigEndian.PutUint16(buffer[offset+2:offset+4], answer.Class)
+		binary.BigEndian.PutUint32(buffer[offset+4:offset+8], answer.TTL)
+		binary.BigEndian.PutUint16(buffer[offset+8:offset+10], answer.RDLength)
+		copy(buffer[offset+10:offset+14], answer.RData)
+		offset += 14
 	}
 
 	return buffer, nil
